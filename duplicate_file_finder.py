@@ -1,7 +1,7 @@
 """Lightweight duplicate-file finder for Windows.
 
-The application deliberately performs no scan on startup. It restores the last
-completed result from a small JSON cache, and scans only after the user clicks
+The application deliberately performs no scan on startup. It restores the latest
+saved result from a small JSON cache, and scans only after the user clicks
 Scan Now. A scan runs in a worker thread so cached results stay usable while a
 new scan is in progress.
 """
@@ -18,13 +18,14 @@ import tempfile
 import threading
 import time
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
 APP_NAME = "Duplicate File Finder"
+APP_VERSION = "1.0.1"
 CACHE_VERSION = 1
 HASH_CHUNK_SIZE = 1024 * 1024
 
@@ -34,6 +35,30 @@ class ScanProgress:
     files_seen: int
     candidates: int
     hashed: int
+
+
+@dataclass
+class ScanReport:
+    files_seen: int = 0
+    hashed: int = 0
+    errors: int = 0
+    skipped_links: int = 0
+    issues: List[Dict[str, str]] = field(default_factory=list)
+
+    def issue(self, path: str, reason: str) -> None:
+        self.errors += 1
+        if len(self.issues) < 50:
+            self.issues.append({"path": path, "reason": reason})
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "complete": self.errors == 0,
+            "files_seen": self.files_seen,
+            "hashed": self.hashed,
+            "errors": self.errors,
+            "skipped_links": self.skipped_links,
+            "issues": self.issues,
+        }
 
 
 def cache_file_path() -> Path:
@@ -78,12 +103,18 @@ def format_timestamp(value: float) -> str:
 
 
 def hash_file(path: str, cancel: Optional[threading.Event] = None) -> Optional[Tuple[str, int]]:
-    """Hash one regular file and return (sha256, final_size), or None on failure."""
+    """Return a stable file's (sha256, size), or None on cancellation/read/change."""
+
+    def signature(info: os.stat_result) -> Tuple[int, ...]:
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
     digest = hashlib.sha256()
     total = 0
     try:
         with open(path, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                return None
             while True:
                 if cancel is not None and cancel.is_set():
                     return None
@@ -92,7 +123,17 @@ def hash_file(path: str, cancel: Optional[threading.Event] = None) -> Optional[T
                     break
                 digest.update(chunk)
                 total += len(chunk)
-    except (OSError, PermissionError):
+            after = os.fstat(handle.fileno())
+            if signature(before) != signature(after) or total != before.st_size:
+                return None
+            # Windows stat/fstat can expose different creation-time values for
+            # the same unchanged file. Compare ctime only between handle reads;
+            # identity, size and modification time also validate the path.
+            if signature(after)[:-1] != signature(os.stat(path))[:-1]:
+                return None
+    except OSError:
+        return None
+    if cancel is not None and cancel.is_set():
         return None
     return digest.hexdigest(), total
 
@@ -101,9 +142,11 @@ def iter_regular_files(
     roots: Sequence[str],
     cancel: Optional[threading.Event] = None,
     progress: Optional[Callable[[ScanProgress], None]] = None,
+    report: Optional[ScanReport] = None,
 ) -> Iterable[Tuple[str, int]]:
-    """Yield regular file paths and sizes, skipping inaccessible entries."""
+    """Yield regular files and record the locations that could not be checked."""
 
+    report = report if report is not None else ScanReport()
     seen: Set[str] = set()
     files_seen = 0
     candidates = 0
@@ -115,13 +158,18 @@ def iter_regular_files(
                 return
             path = os.path.abspath(os.path.join(directory, filename))
             key = canonical_path(path)
-            if key in seen or os.path.islink(path):
+            if key in seen:
                 continue
             seen.add(key)
+            if os.path.islink(path):
+                report.skipped_links += 1
+                continue
             files_seen += 1
+            report.files_seen += 1
             try:
                 info = os.stat(path)
-            except (OSError, PermissionError):
+            except OSError as error:
+                report.issue(path, str(error))
                 continue
             if not stat.S_ISREG(info.st_mode):
                 continue
@@ -134,24 +182,40 @@ def iter_regular_files(
         if cancel is not None and cancel.is_set():
             return
         root_path = os.path.abspath(os.path.expanduser(root))
-        if not os.path.exists(root_path):
+        try:
+            root_info = os.stat(root_path)
+        except OSError as error:
+            report.issue(root_path, str(error))
             continue
-        if os.path.isfile(root_path) and not os.path.islink(root_path):
+        if os.path.islink(root_path):
+            report.skipped_links += 1
+            report.issue(root_path, "This location is a symbolic link. Select its target folder to scan it.")
+            continue
+        if stat.S_ISREG(root_info.st_mode):
             yield from process_filenames(os.path.dirname(root_path), [os.path.basename(root_path)])
             continue
+        if not stat.S_ISDIR(root_info.st_mode):
+            report.issue(root_path, "This location is not a regular file or folder.")
+            continue
+
+        def walk_error(error: OSError) -> None:
+            report.issue(str(error.filename or root_path), str(error))
+
         try:
-            walker = os.walk(root_path, topdown=True, followlinks=False, onerror=lambda _error: None)
+            walker = os.walk(root_path, topdown=True, followlinks=False, onerror=walk_error)
             for directory, subdirectories, filenames in walker:
                 if cancel is not None and cancel.is_set():
                     return
-                subdirectories[:] = [
-                    name
-                    for name in subdirectories
-                    if not os.path.islink(os.path.join(directory, name))
-                ]
+                kept_directories = []
+                for name in subdirectories:
+                    if os.path.islink(os.path.join(directory, name)):
+                        report.skipped_links += 1
+                    else:
+                        kept_directories.append(name)
+                subdirectories[:] = kept_directories
                 yield from process_filenames(directory, filenames)
-        except (OSError, PermissionError):
-            continue
+        except OSError as error:
+            walk_error(error)
 
 
 def find_duplicate_groups(
@@ -161,59 +225,86 @@ def find_duplicate_groups(
 ) -> Optional[Dict[str, Any]]:
     """Find groups with matching size and SHA-256 content."""
 
+    if cancel is not None and cancel.is_set():
+        return None
+    report = ScanReport()
     by_size: Dict[int, List[str]] = {}
     files_seen = 0
     candidates = 0
-    for path, size in iter_regular_files(roots, cancel, progress):
+    for path, size in iter_regular_files(roots, cancel, progress, report):
         if cancel is not None and cancel.is_set():
             return None
         by_size.setdefault(size, []).append(path)
         files_seen += 1
         candidates += 1
 
-    possible = [paths for paths in by_size.values() if len(paths) > 1]
+    # Enumeration may end by returning immediately on cancellation, yielding no
+    # final file. Check here even when no size bucket needs hashing.
+    if cancel is not None and cancel.is_set():
+        return None
     groups: List[Dict[str, Any]] = []
     hashed = 0
-    for paths in possible:
+    for size, paths in by_size.items():
         if cancel is not None and cancel.is_set():
             return None
+        if len(paths) < 2:
+            continue
         by_hash: Dict[str, List[str]] = {}
         for path in paths:
             result = hash_file(path, cancel)
             if result is None:
                 if cancel is not None and cancel.is_set():
                     return None
+                report.issue(path, "Could not read this file, or it changed while being hashed.")
                 continue
             digest, final_size = result
-            try:
-                current_size = os.path.getsize(path)
-            except OSError:
-                continue
-            if final_size != current_size:
+            if final_size != size:
+                report.issue(path, "File size changed after it was listed.")
                 continue
             by_hash.setdefault(digest, []).append(path)
             hashed += 1
+            report.hashed = hashed
             if progress is not None:
                 progress(ScanProgress(files_seen, candidates, hashed))
+        if cancel is not None and cancel.is_set():
+            return None
         for digest, matching_paths in by_hash.items():
             if len(matching_paths) < 2:
                 continue
-            ordered_paths = sorted(matching_paths, key=lambda item: canonical_path(item))
+            stable_paths = []
+            for path in matching_paths:
+                if cancel is not None and cancel.is_set():
+                    return None
+                try:
+                    info = os.stat(path)
+                    if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+                        report.issue(path, "File changed after it was hashed.")
+                        continue
+                except OSError as error:
+                    report.issue(path, str(error))
+                    continue
+                stable_paths.append(path)
+            if len(stable_paths) < 2:
+                continue
+            ordered_paths = sorted(stable_paths, key=canonical_path)
             groups.append(
                 {
-                    "id": f"{len(matching_paths)}-{digest}",
-                    "size": int(os.path.getsize(ordered_paths[0])),
+                    "id": f"{size}-{digest}",
+                    "size": size,
                     "hash": digest,
                     "paths": ordered_paths,
                 }
             )
 
     groups.sort(key=lambda group: (-int(group["size"]), canonical_path(group["paths"][0])))
+    if cancel is not None and cancel.is_set():
+        return None
     return {
         "version": CACHE_VERSION,
         "roots": [os.path.abspath(os.path.expanduser(root)) for root in roots],
         "scanned_at": time.time(),
         "groups": groups,
+        "scan": report.as_dict(),
     }
 
 
@@ -228,8 +319,11 @@ def _valid_group(group: Any) -> bool:
     return isinstance(paths, list) and len(paths) >= 2 and all(isinstance(path, str) for path in paths)
 
 
-def load_cache(path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
-    path = path or cache_file_path()
+def partial_cache_path(path: Path) -> Path:
+    return path.with_name(path.stem + ".partial" + path.suffix)
+
+
+def _load_cache_file(path: Path) -> Optional[Dict[str, Any]]:
     try:
         with path.open("r", encoding="utf-8") as handle:
             data = json.load(handle)
@@ -237,16 +331,33 @@ def load_cache(path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
         return None
     if not isinstance(data, dict) or data.get("version") != CACHE_VERSION:
         return None
-    groups = [group for group in data.get("groups", []) if _valid_group(group)]
+    raw_groups = data.get("groups", [])
+    if not isinstance(raw_groups, list):
+        return None
+    groups = [group for group in raw_groups if _valid_group(group)]
     roots = data.get("roots", [])
     if not isinstance(roots, list) or not all(isinstance(root, str) for root in roots):
         roots = []
-    return {
+    scanned_at = data.get("scanned_at", 0)
+    if not isinstance(scanned_at, (int, float)):
+        scanned_at = 0
+    loaded = {
         "version": CACHE_VERSION,
         "roots": roots,
-        "scanned_at": data.get("scanned_at", 0),
+        "scanned_at": scanned_at,
         "groups": groups,
     }
+    if isinstance(data.get("scan"), dict):
+        loaded["scan"] = data["scan"]
+    return loaded
+
+
+def load_cache(path: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+    """Restore the newest valid completed or incomplete scan without rescanning."""
+
+    path = path or cache_file_path()
+    snapshots = [data for data in (_load_cache_file(path), _load_cache_file(partial_cache_path(path))) if data is not None]
+    return max(snapshots, key=lambda data: data["scanned_at"]) if snapshots else None
 
 
 def save_cache(data: Dict[str, Any], path: Optional[Path] = None) -> None:
@@ -259,6 +370,36 @@ def save_cache(data: Dict[str, Any], path: Optional[Path] = None) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(str(temporary), str(path))
+
+
+def remove_paths_from_groups(groups: Sequence[Dict[str, Any]], removed: Set[str]) -> List[Dict[str, Any]]:
+    """Make a new result without removed files or groups with fewer than two copies."""
+
+    result = []
+    for group in groups:
+        paths = [path for path in group.get("paths", []) if canonical_path(path) not in removed]
+        if len(paths) >= 2:
+            result.append({**group, "paths": paths})
+    return result
+
+
+def update_saved_deletions(cache: Dict[str, Any], path: Path, removed: Set[str]) -> List[str]:
+    """Update both snapshots so an older cache cannot restore deleted rows."""
+
+    partial_path = partial_cache_path(path)
+    snapshots = {path: _load_cache_file(path), partial_path: _load_cache_file(partial_path)}
+    active_path = path if cache.get("scan", {}).get("complete", True) else partial_path
+    snapshots[active_path] = cache
+    errors = []
+    for destination, saved in snapshots.items():
+        if saved is None:
+            continue
+        updated = {**saved, "groups": remove_paths_from_groups(saved.get("groups", []), removed)}
+        try:
+            save_cache(updated, destination)
+        except OSError as error:
+            errors.append(f"{destination.name}: {error}")
+    return errors
 
 
 def select_safe_paths(groups: Sequence[Dict[str, Any]], selected: Set[str]) -> List[str]:
@@ -337,6 +478,8 @@ class DuplicateFileFinderApp(tk.Tk):
         self.cache_path = cache_file_path()
         self.cache: Optional[Dict[str, Any]] = load_cache(self.cache_path)
         self.groups: List[Dict[str, Any]] = list(self.cache.get("groups", [])) if self.cache else []
+        self.latest_scan: Optional[Dict[str, Any]] = self.cache
+        self.deleted_during_scan: Set[str] = set()
         self.selected_paths: Set[str] = set()
         self.item_meta: Dict[str, Tuple[str, Any]] = {}
         self.queue: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
@@ -375,7 +518,7 @@ class DuplicateFileFinderApp(tk.Tk):
         root_buttons = ttk.Frame(roots_frame)
         root_buttons.pack(side="left", padx=(8, 0))
         ttk.Button(root_buttons, text="Add folder…", command=self._add_folder).pack(fill="x")
-        ttk.Button(root_buttons, text="All local drives", command=self._add_local_drives).pack(fill="x", pady=3)
+        ttk.Button(root_buttons, text="All fixed drives", command=self._add_local_drives).pack(fill="x", pady=3)
         ttk.Button(root_buttons, text="Remove selected", command=self._remove_roots).pack(fill="x")
         ttk.Button(root_buttons, text="Clear", command=self._clear_roots).pack(fill="x", pady=(3, 0))
 
@@ -404,8 +547,17 @@ class DuplicateFileFinderApp(tk.Tk):
 
         status_frame = ttk.Frame(outer)
         status_frame.pack(fill="x", pady=(0, 5))
-        ttk.Label(status_frame, textvariable=self.status_text).pack(side="left")
-        ttk.Label(status_frame, text="Double-click a file or group to select it.", foreground="#666666").pack(side="right")
+        status_label = ttk.Label(status_frame, textvariable=self.status_text, justify="left", wraplength=900)
+        status_label.pack(side="left", fill="x", expand=True)
+        self.details_button = ttk.Button(
+            status_frame, text="Scan details…", command=self._show_scan_details,
+            state="normal" if self.latest_scan else "disabled",
+        )
+        self.details_button.pack(side="right", padx=(8, 0))
+        status_frame.bind(
+            "<Configure>",
+            lambda event: status_label.configure(wraplength=max(300, event.width - self.details_button.winfo_reqwidth() - 16)),
+        )
 
         tree_frame = ttk.Frame(outer)
         tree_frame.pack(fill="both", expand=True)
@@ -436,9 +588,16 @@ class DuplicateFileFinderApp(tk.Tk):
         tree_frame.rowconfigure(0, weight=1)
         tree_frame.columnconfigure(0, weight=1)
         self.tree.bind("<Double-1>", self._double_click_tree)
+        ttk.Label(outer, text="Double-click a file or group to select it.", foreground="#666666").pack(anchor="w", pady=(4, 0))
 
     def _set_initial_status(self) -> None:
-        if self.cache and self.groups:
+        if self.cache and not self.cache.get("scan", {}).get("complete", True):
+            self.cache_text.set("Cached incomplete result")
+            self.status_text.set(
+                f"{len(self.groups)} duplicate groups loaded from an incomplete scan. "
+                "See Scan details for skipped locations; click Scan Now to rescan."
+            )
+        elif self.cache and self.groups:
             scanned = format_timestamp(float(self.cache.get("scanned_at", 0)))
             self.cache_text.set(f"Cached result: {scanned}")
             self.status_text.set(f"{len(self.groups)} duplicate groups loaded. No scan will run until you click Scan Now.")
@@ -447,7 +606,46 @@ class DuplicateFileFinderApp(tk.Tk):
             self.status_text.set("The last scan found no duplicate groups. Choose locations and click Scan Now to rescan.")
         else:
             self.cache_text.set("No saved scan")
-            self.status_text.set("Choose folders or all local drives, then click Scan Now.")
+            self.status_text.set("Choose folders or all fixed drives, then click Scan Now.")
+
+    def _show_scan_details(self) -> None:
+        if self.latest_scan is None:
+            return
+        report = self.latest_scan.get("scan", {})
+        coverage = "unknown (older cache without coverage records)"
+        if "complete" in report:
+            coverage = "complete" if report["complete"] else "INCOMPLETE"
+        lines = [
+            "Scan coverage: " + coverage,
+            f"Files listed: {report.get('files_seen', 'not recorded in this older cache')}",
+            f"Files hashed: {report.get('hashed', 'not recorded in this older cache')}",
+            f"Read/location failures: {report.get('errors', 0)}",
+            f"Symbolic links excluded: {report.get('skipped_links', 0)}",
+            "",
+            "Selected locations:",
+            *self.latest_scan.get("roots", []),
+            "",
+            "Symbolic links are excluded. Add the target folder to scan its files.",
+            "Incomplete scans use a separate cache; the last completed cache is preserved.",
+            "",
+        ]
+        for issue in report.get("issues", []):
+            lines.extend([issue["path"], "  " + issue["reason"], ""])
+        if report.get("errors", 0) > len(report.get("issues", [])):
+            lines.append("Only the first 50 failures are shown; the count above includes all failures.")
+        dialog = tk.Toplevel(self)
+        dialog.title("Scan details")
+        dialog.geometry("860x520")
+        frame = ttk.Frame(dialog, padding=10)
+        frame.pack(fill="both", expand=True)
+        text = tk.Text(frame, wrap="word", width=100, height=24)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        text.pack(fill="both", expand=True)
+        text.insert("1.0", "\n".join(lines))
+        text.configure(state="disabled")
+        ttk.Button(dialog, text="Close", command=dialog.destroy).pack(pady=(0, 10))
 
     def _load_roots_from_cache(self) -> None:
         roots = self.cache.get("roots", []) if self.cache else []
@@ -493,13 +691,14 @@ class DuplicateFileFinderApp(tk.Tk):
         self.root_list.delete(0, tk.END)
 
     def _start_scan(self) -> None:
-        if self.scan_thread is not None and self.scan_thread.is_alive():
+        if self.scan_thread is not None:
             return
         roots = self._roots()
         if not roots:
-            messagebox.showinfo(APP_NAME, "Choose at least one folder, or use All local drives.", parent=self)
+            messagebox.showinfo(APP_NAME, "Choose at least one folder, or use All fixed drives.", parent=self)
             return
         self.cancel_event.clear()
+        self.deleted_during_scan.clear()
         self.scan_button.configure(state="disabled")
         self.cancel_button.configure(state="normal")
         self.status_text.set("Scanning… cached results remain available and can still be deleted.")
@@ -507,24 +706,27 @@ class DuplicateFileFinderApp(tk.Tk):
         self.scan_thread.start()
 
     def _cancel_scan(self) -> None:
-        if self.scan_thread is not None and self.scan_thread.is_alive():
+        if self.scan_thread is not None:
             self.cancel_event.set()
             self.status_text.set("Cancelling scan… cached results remain available.")
 
     def _scan_worker(self, roots: Sequence[str]) -> None:
+        last_report = 0.0
+
         def report(progress: ScanProgress) -> None:
-            if progress.files_seen == 1 or progress.files_seen % 200 == 0 or progress.hashed % 100 == 0:
+            nonlocal last_report
+            now = time.monotonic()
+            if now - last_report >= 0.2:
                 self.queue.put(("progress", progress))
+                last_report = now
 
         try:
             result = find_duplicate_groups(roots, self.cancel_event, report)
-            if result is None:
+            if result is None or self.cancel_event.is_set():
                 self.queue.put(("cancelled", None))
                 return
-            try:
-                save_cache(result, self.cache_path)
-            except OSError as error:
-                self.queue.put(("cache_error", str(error)))
+            # Only the UI thread accepts results and writes the cache. A scan
+            # may finish just before Cancel/Close or a cached-file deletion.
             self.queue.put(("result", result))
         except Exception as error:  # keep worker failures visible in the UI
             self.queue.put(("error", f"{type(error).__name__}: {error}"))
@@ -534,23 +736,17 @@ class DuplicateFileFinderApp(tk.Tk):
             while True:
                 kind, payload = self.queue.get_nowait()
                 if kind == "progress":
+                    if self.cancel_event.is_set():
+                        continue
                     progress = payload
                     self.status_text.set(
                         f"Scanning… {progress.files_seen:,} files seen; {progress.hashed:,} candidates hashed."
                     )
-                elif kind == "cache_error":
-                    self.status_text.set(f"Scan finished, but the cache could not be saved: {payload}")
                 elif kind == "cancelled":
                     self._finish_scan()
                     self.status_text.set("Scan cancelled. The previous cached result was kept.")
                 elif kind == "result":
-                    self.cache = payload
-                    self.groups = list(payload.get("groups", []))
-                    self.selected_paths.clear()
-                    self._finish_scan()
-                    self._render_tree()
-                    self.cache_text.set(f"Cached result: {format_timestamp(float(payload.get('scanned_at', 0)))}")
-                    self.status_text.set(f"Scan finished: {len(self.groups)} duplicate groups found.")
+                    self._accept_scan_result(payload)
                 elif kind == "error":
                     self._finish_scan()
                     self.status_text.set("Scan failed; the previous cached result was kept.")
@@ -558,6 +754,52 @@ class DuplicateFileFinderApp(tk.Tk):
         except queue.Empty:
             pass
         self.after(100, self._poll_queue)
+
+    def _accept_scan_result(self, payload: Dict[str, Any]) -> None:
+        if self.cancel_event.is_set():
+            self._finish_scan()
+            self.status_text.set("Scan cancelled. The previous cached result was kept.")
+            return
+        payload = {**payload, "groups": remove_paths_from_groups(payload.get("groups", []), self.deleted_during_scan)}
+        self.latest_scan = payload
+        self.details_button.configure(state="normal")
+        report = payload.get("scan", {})
+        self._finish_scan()
+        if not report.get("complete", True) and not report.get("files_seen", 0):
+            self.status_text.set(
+                f"Incomplete scan: no files could be checked; {report.get('errors', 0)} failures. "
+                "Previous results and cache kept. See Scan details."
+            )
+            return
+        self.groups = list(payload["groups"])
+        self.selected_paths.clear()
+        self._render_tree()
+        if not report.get("complete", True):
+            self.cache = payload
+            try:
+                save_cache(payload, partial_cache_path(self.cache_path))
+            except OSError as error:
+                self.cache_text.set("Incomplete result not saved")
+                self.status_text.set(f"Incomplete scan: {len(self.groups)} groups. Partial cache could not be saved: {error}")
+                return
+            self.cache_text.set("Cached incomplete result · completed cache kept")
+            self.status_text.set(
+                f"Incomplete scan: {len(self.groups)} duplicate groups; {report.get('errors', 0)} failures. "
+                "Partial results saved separately; completed cache kept. See Scan details."
+            )
+            return
+        self.cache = payload
+        try:
+            save_cache(payload, self.cache_path)
+        except OSError as error:
+            self.cache_text.set("Results not saved")
+            self.status_text.set(f"Scan finished: {len(self.groups)} groups. Cache could not be saved: {error}")
+            return
+        self.cache_text.set(f"Cached result: {format_timestamp(float(payload.get('scanned_at', 0)))}")
+        self.status_text.set(
+            f"Scan finished: {len(self.groups)} duplicate groups; {report.get('files_seen', 0):,} files checked. "
+            f"{report.get('skipped_links', 0)} symbolic links excluded."
+        )
 
     def _finish_scan(self) -> None:
         self.scan_thread = None
@@ -702,31 +944,31 @@ class DuplicateFileFinderApp(tk.Tk):
             return
         deleted, failures = delete_paths(verified, recycle=(os.name == "nt"))
         deleted_keys = {canonical_path(path) for path in deleted}
+        cache_error = None
         if deleted_keys:
-            for group in self.groups:
-                group["paths"] = [path for path in group.get("paths", []) if canonical_path(path) not in deleted_keys]
-            self.groups = [group for group in self.groups if len(group.get("paths", [])) >= 2]
+            if self.scan_thread is not None:
+                self.deleted_during_scan.update(deleted_keys)
+            self.groups = remove_paths_from_groups(self.groups, deleted_keys)
             self.selected_paths = {path for path in self.selected_paths if canonical_path(path) not in deleted_keys}
-            if self.cache is None:
-                self.cache = {"version": CACHE_VERSION, "roots": self._roots(), "scanned_at": time.time(), "groups": []}
-            self.cache["groups"] = self.groups
-            try:
-                save_cache(self.cache, self.cache_path)
-            except OSError:
-                pass
+            if self.cache is not None:
+                self.cache = {**self.cache, "groups": remove_paths_from_groups(self.cache.get("groups", []), deleted_keys)}
+                cache_errors = update_saved_deletions(self.cache, self.cache_path, deleted_keys)
+                if cache_errors:
+                    cache_error = "; ".join(cache_errors)
             self._render_tree()
         summary = f"Moved {len(deleted)} file(s) to the Recycle Bin."
         if failures or skipped:
             summary += f" Skipped {len(failures) + len(skipped)} file(s) that could not be verified or moved."
-        if self.scan_thread is not None and self.scan_thread.is_alive():
+        if cache_error:
+            summary += f" Cache update failed: {cache_error}"
+        if self.scan_thread is not None:
             summary += " The scan is still running."
         self.status_text.set(summary)
-        if failures:
+        if failures or cache_error:
             messagebox.showwarning(APP_NAME, summary, parent=self)
 
     def _close(self) -> None:
-        if self.scan_thread is not None and self.scan_thread.is_alive():
-            self.cancel_event.set()
+        self.cancel_event.set()
         self.destroy()
 
 
